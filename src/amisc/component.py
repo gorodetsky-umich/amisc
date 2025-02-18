@@ -40,7 +40,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, ValidationInfo, field_validator
 from typing_extensions import TypedDict
 
-from amisc.interpolator import Interpolator, InterpolatorState, Lagrange
+from amisc.interpolator import Interpolator, InterpolatorState, Lagrange, GPR
 from amisc.serialize import PickleSerializable, Serializable, StringSerializable, YamlSerializable
 from amisc.training import SparseGrid, TrainingData
 from amisc.typing import COORDS_STR_ID, LATENT_STR_ID, Dataset, MultiIndex
