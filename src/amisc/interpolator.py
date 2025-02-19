@@ -57,9 +57,7 @@ class GPRState(InterpolatorState, Base64Serializable):
     
     :ivar GPs: list of trained GP Regression models
     """
-    GPs: list[GaussianProcessRegressor] = field(default_factory=list)
-    x_grids: dict[str, np.ndarray] = field(default_factory=dict)
-    y_grids: dict[str, np.ndarray] = field(default_factory=dict)
+    curr_GP: GaussianProcessRegressor = None
 
     def __eq__(self, other):
         if isinstance(other, GPRState):
@@ -506,42 +504,16 @@ class GPR(Interpolator, StringSerializable):
         """
         xtrain, ytrain = training_data
 
-        # Initialize the interpolator state
-        if old_state is None:
-            GPs = []
-            x_arr = np.concatenate([xtrain[var][..., np.newaxis] for var in xtrain],axis = -1)
-            y_arr = np.concatenate([ytrain[var][..., np.newaxis] for var in ytrain], axis = -1)
-            
-            kern = C(1.0, (1e-3, 1e3)) * RBF(0.1, (1e-3, 1e3)) + WhiteKernel(noise_level=0.5, noise_level_bounds=(1e-3, 1e3))
-            gp = GaussianProcessRegressor(kernel=kern, n_restarts_optimizer=10)
-            gp.fit(x_arr, y_arr)
-            GPs.append(gp)
+        x_arr = np.concatenate([xtrain[var][..., np.newaxis] for var in xtrain], axis=-1)
+        y_arr = np.concatenate([ytrain[var][..., np.newaxis] for var in ytrain], axis=-1)
 
-            x_grids = {var: x_arr[:,i] for i,var in enumerate(xtrain)}
-            y_grids = {var: y_arr[:,i] for i,var in enumerate(ytrain)} 
-            
-        # Otherwise, refine the interpolator state
-        else: 
-            
-            x_arr = np.concatenate([xtrain[var][..., np.newaxis] for var in xtrain],axis = -1)
-            y_arr = np.concatenate([ytrain[var][..., np.newaxis] for var in ytrain], axis = -1)
+        kern = C(1.0, (1e-3, 1e3))*RBF(0.1, (1e-2,1e2))
+        gp = GaussianProcessRegressor(kernel=kern, alpha = 1e-10, n_restarts_optimizer=10)
+        gp.fit(x_arr, y_arr)
 
-            #x_grids = {var: x_arr[:,i] for i,var in enumerate(xtrain)}
-            #y_grids = {var: y_arr[:,i] for i,var in enumerate(ytrain)}
-            
-            GPs = old_state.GPs
-            gp_old = GPs[-1]
-            pred = gp_old.predict(x_arr)
-            if pred.ndim == 1:
-                pred = pred[:, np.newaxis]
-            res = y_arr - pred
-            kern = C(1.0, (1e-3, 1e3)) * RBF(0.1, (1e-3, 1e3)) + WhiteKernel(noise_level=0.5, noise_level_bounds=(1e-3, 1e3))
-            gp = GaussianProcessRegressor(kernel=kern, n_restarts_optimizer=10)
-            gp.fit(x_arr, res)
-            GPs.append(gp)
+        return GPRState(curr_GP=gp)
 
         
-        return GPRState(GPs=GPs, x_grids=xtrain, y_grids=ytrain)
 
     def predict(self, x: Dataset, state: GPRState, training_data: tuple[Dataset, Dataset]) -> Dataset:
         """Predict the output of the model at points `x` with Gaussian Process Regression."""
@@ -552,20 +524,26 @@ class GPR(Interpolator, StringSerializable):
         x_arr = np.concatenate([x[var].reshape(-1,1) for var in xi], axis=1) # x_arr needs to be in shape (nSamples, nFeatures)
         yi_arr = np.concatenate([yi[var].reshape(-1,1) for var in yi], axis=1) # yi_arr needs to be in shape (nSamples, nTargets)
 
-        y_pred_total = np.zeros((x_arr.shape[0],yi_arr.shape[1])) # Prediction array will be in shape (nSamples, nTargets)
+        #y_pred_total = np.zeros((x_arr.shape[0],yi_arr.shape[1])) # Prediction array will be in shape (nSamples, nTargets)
 
         # Loop over each GP model and sum the predictions
-        for gp in state.GPs:
+        '''for gp in state.GPs:
             y_pred = gp.predict(x_arr)
             if y_pred.ndim == 1:
                 y_pred = y_pred[:, np.newaxis]
-            y_pred_total += y_pred
+            y_pred_total += y_pred'''
+        
+        gp = state.curr_GP
+        y_pred = gp.predict(x_arr)
+        if y_pred.ndim == 1:
+            y_pred = y_pred[:, np.newaxis]
+
 
         # Unpack the outputs back into a Dataset
         x_dim = next(iter(x.values())).shape
         y_ret = {}
         for i, var in enumerate(yi):
-            y_ret[var] = y_pred_total[:,i].reshape(x_dim)
+            y_ret[var] = y_pred[:,i].reshape(x_dim)
         
         return y_ret
     

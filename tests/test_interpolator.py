@@ -276,6 +276,7 @@ def test_tensor_product_2d_GPR(plots=False):
     ytest = interp.predict(xtest, new_state, training_data)['y']
     ytruth = bb_2d_func(xtest)['y']
     l2_error = relative_error(ytest, ytruth)
+    print(l2_error)
     assert l2_error < 1e-1
 
     if plots:
@@ -316,3 +317,5 @@ def test_tensor_product_2d_GPR(plots=False):
         fig.set_size_inches(15, 11)
         fig.tight_layout()
         plt.show()
+    
+t1 = test_tensor_product_2d_GPR(plots=True)
