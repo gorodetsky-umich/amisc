@@ -15,7 +15,7 @@ from uqtils import approx_hess, approx_jac, ax_default
 from amisc import YamlLoader
 from amisc.component import Component, IndexSet, MiscTree, ModelKwargs, StringKwargs
 from amisc.compression import SVD
-from amisc.interpolator import Interpolator, InterpolatorState, LagrangeState
+from amisc.interpolator import Interpolator, InterpolatorState, LagrangeState, GPRState
 from amisc.serialize import Base64Serializable, Serializable, StringSerializable
 from amisc.training import TrainingData
 from amisc.typing import LATENT_STR_ID
@@ -543,3 +543,6 @@ def test_compression_empty_fields():
 
     for original, reconstruct in zip(outputs['p'][~error_cases], recon['p'][~error_cases]):
         assert relative_error(reconstruct, original) < 1e-6
+
+t1 = test_sparse_grid(plots=True)
+t2 = test_field_quantity()
