@@ -23,28 +23,56 @@ def test_sparse_grid():
     y_vars = VariableList(['y1', 'y2', 'y3'])
     domains = x_vars.get_domains(norm=True)
     weight_fcns = x_vars.get_pdfs(norm=True)
-    grid = SparseGrid(collocation_rule='leja', knots_per_level=2)
+    collocation_rules = ['leja', 'uncertainty']
+    variance_criteria = ['local', 'global']
+    for collocation_rule in collocation_rules:
+        if collocation_rule == 'uncertainty':
+            for variance_criterion in variance_criteria:
+                grid = SparseGrid(collocation_rule=collocation_rule, knots_per_level=2, 
+                                  variance_criterion=variance_criterion)
+                beta_list = list(itertools.product(*[range(3) for _ in range(len(x_vars))]))
+                alpha_list = [()] * len(beta_list)
+                design_list = []
+                design_pts = []
+                y_list = []
 
-    beta_list = list(itertools.product(*[range(3) for _ in range(len(x_vars))]))
-    alpha_list = [()] * len(beta_list)
-    design_list = []
-    design_pts = []
-    y_list = []
+                # Refine the sparse grid
+                for alpha, beta in zip(alpha_list, beta_list):
+                    new_idx, new_pts = grid.refine(alpha, beta, domains, weight_fcns)
+                    new_y = simple_model(new_pts)
+                    design_list.append(new_idx)
+                    design_pts.append(new_pts)
+                    y_list.append(new_y)
+                    grid.set(alpha, beta, new_idx, new_y)
 
-    # Refine the sparse grid
-    for alpha, beta in zip(alpha_list, beta_list):
-        new_idx, new_pts = grid.refine(alpha, beta, domains, weight_fcns)
-        new_y = simple_model(new_pts)
-        design_list.append(new_idx)
-        design_pts.append(new_pts)
-        y_list.append(new_y)
-        grid.set(alpha, beta, new_idx, new_y)
+                # Extract data from sparse grid and check values
+                for i, (alpha, beta) in enumerate(zip(alpha_list, beta_list)):
+                    x_pts, y_pts = grid.get_by_coord(alpha, design_list[i])
+                    assert all([np.allclose(design_pts[i][var], x_pts[var]) for var in x_vars])
+                    assert all([np.allclose(y_list[i][var], y_pts[var]) for var in y_vars])
+        else: 
+            grid = SparseGrid(collocation_rule=collocation_rule, knots_per_level=2)
 
-    # Extract data from sparse grid and check values
-    for i, (alpha, beta) in enumerate(zip(alpha_list, beta_list)):
-        x_pts, y_pts = grid.get_by_coord(alpha, design_list[i])
-        assert all([np.allclose(design_pts[i][var], x_pts[var]) for var in x_vars])
-        assert all([np.allclose(y_list[i][var], y_pts[var]) for var in y_vars])
+            beta_list = list(itertools.product(*[range(3) for _ in range(len(x_vars))]))
+            alpha_list = [()] * len(beta_list)
+            design_list = []
+            design_pts = []
+            y_list = []
+
+            # Refine the sparse grid
+            for alpha, beta in zip(alpha_list, beta_list):
+                new_idx, new_pts = grid.refine(alpha, beta, domains, weight_fcns)
+                new_y = simple_model(new_pts)
+                design_list.append(new_idx)
+                design_pts.append(new_pts)
+                y_list.append(new_y)
+                grid.set(alpha, beta, new_idx, new_y)
+
+            # Extract data from sparse grid and check values
+            for i, (alpha, beta) in enumerate(zip(alpha_list, beta_list)):
+                x_pts, y_pts = grid.get_by_coord(alpha, design_list[i])
+                assert all([np.allclose(design_pts[i][var], x_pts[var]) for var in x_vars])
+                assert all([np.allclose(y_list[i][var], y_pts[var]) for var in y_vars])
 
 
 def test_imputer():

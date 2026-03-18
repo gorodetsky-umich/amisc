@@ -276,7 +276,8 @@ class Lagrange(Interpolator, StringSerializable):
 
         return LagrangeState(weights=weights, x_grids=x_grids)
 
-    def predict(self, x: Dataset, state: LagrangeState, training_data: tuple[Dataset, Dataset]):
+    def predict(self, x: Dataset, state: LagrangeState, training_data: tuple[Dataset, Dataset], 
+                groups: list[list[str]] = None):
         """Predict the output of the model at points `x` with barycentric Lagrange interpolation."""
         # Convert `x` and `yi` to 2d arrays: (N, xdim) and (N, ydim)
         # Inputs `x` may come in unordered, but they should get realigned with the internal `x_grids` state
@@ -306,19 +307,41 @@ class Lagrange(Interpolator, StringSerializable):
         y = np.zeros(x_arr.shape[:-1] + (ydim,))        # (..., ydim)
 
         # Loop over multi-indices and compute tensor-product lagrange polynomials
-        indices = [range(s) for s in grid_sizes.values()]
-        for i, j in enumerate(itertools.product(*indices)):
-            L_j = quotient[..., dims, j] / qsum         # (..., xdim)
 
-            # Set L_j(x==x_j)=1 for the current j and set L_j(x==x_j)=0 for x_j = x_i, i != j
-            if check_interp_pts:
-                other_pts = np.copy(div_zero_idx)
-                other_pts[div_zero_idx[..., dims, j]] = False
-                L_j[div_zero_idx[..., dims, j]] = 1
-                L_j[np.any(other_pts, axis=-1)] = 0
+        if groups:
+            # sizes per group (assumes each member of a group shares same 1D grid length)
+            group_sizes = [int(state.x_grids[grp[0]].shape[0]) for grp in groups]
+            for i_group, group_idx_tuple in enumerate(itertools.product(*[range(s) for s in group_sizes])):
+                # expand group-level indices into per-variable multi-index j (repeat per group member)
+                j_list = []
+                for grp_idx, grp in zip(group_idx_tuple, groups):
+                    j_list.extend([grp_idx] * len(grp))
+                j = tuple(j_list)   # length == xdim
 
-            # Add multivariate basis polynomial contribution to interpolation output
-            y += np.prod(L_j, axis=-1, keepdims=True) * yi_arr[i, :]
+                L_j = quotient[..., dims, j] / qsum         # (..., xdim)
+
+                if check_interp_pts:
+                    other_pts = np.copy(div_zero_idx)
+                    other_pts[div_zero_idx[..., dims, j]] = False
+                    L_j[div_zero_idx[..., dims, j]] = 1
+                    L_j[np.any(other_pts, axis=-1)] = 0
+
+                # yi_arr expected to have one row per group-node
+                y += np.prod(L_j, axis=-1, keepdims=True) * yi_arr[i_group, :]
+        else: 
+            indices = [range(s) for s in grid_sizes.values()]
+            for i, j in enumerate(itertools.product(*indices)):
+                L_j = quotient[..., dims, j] / qsum         # (..., xdim)
+
+                # Set L_j(x==x_j)=1 for the current j and set L_j(x==x_j)=0 for x_j = x_i, i != j
+                if check_interp_pts:
+                    other_pts = np.copy(div_zero_idx)
+                    other_pts[div_zero_idx[..., dims, j]] = False
+                    L_j[div_zero_idx[..., dims, j]] = 1
+                    L_j[np.any(other_pts, axis=-1)] = 0
+
+                # Add multivariate basis polynomial contribution to interpolation output
+                y += np.prod(L_j, axis=-1, keepdims=True) * yi_arr[i, :]
 
         # Unpack the outputs back into a Dataset
         y_ret = {}
@@ -609,7 +632,8 @@ class Linear(Interpolator, StringSerializable):
 
         return LinearState(regressor=regressor, x_vars=x_vars, y_vars=y_vars)
 
-    def predict(self, x: Dataset, state: LinearState, training_data: tuple[Dataset, Dataset]):
+    def predict(self, x: Dataset, state: LinearState, training_data: tuple[Dataset, Dataset], 
+                 groups: list[list[str]] = None):
         """Predict the output of the model at points `x` using the linear regressor provided in `state`.
 
         :param x: the input Dataset `dict` mapping input variables to prediction locations
@@ -716,14 +740,23 @@ class GPR(Interpolator, StringSerializable):
         :param input_domains: (not used for `GPR`)
         :returns: the new GPR state
         """
-        gp_kernel = self._construct_kernel(self.kernel if isinstance(self.kernel, list)
-                                           else [self.kernel, self.kernel_opts])
-        gp = GaussianProcessRegressor(kernel=gp_kernel, **self.regressor_opts)
-        pipe = []
-        if self.scaler is not None:
-            pipe.append(('scaler', getattr(preprocessing, self.scaler)(**self.scaler_opts)))
-        pipe.append(('gpr', gp))
-        regressor = Pipeline(pipe)
+        if old_state is None:
+            gp_kernel = self._construct_kernel(self.kernel if isinstance(self.kernel, list)
+                                            else [self.kernel, self.kernel_opts])
+            gp = GaussianProcessRegressor(kernel=gp_kernel, **self.regressor_opts)
+            pipe = []
+            if self.scaler is not None:
+                pipe.append(('scaler', getattr(preprocessing, self.scaler)(**self.scaler_opts)))
+            pipe.append(('gpr', gp))
+            regressor = Pipeline(pipe)
+        else:
+            gp_kernel = old_state.regressor.named_steps['gpr'].kernel_
+            gp = GaussianProcessRegressor(kernel=gp_kernel, **self.regressor_opts)
+            pipe = []
+            if self.scaler is not None:
+                pipe.append(('scaler', getattr(preprocessing, self.scaler)(**self.scaler_opts)))
+            pipe.append(('gpr', gp))
+            regressor = Pipeline(pipe)
 
         xtrain, ytrain = training_data
 
@@ -743,7 +776,8 @@ class GPR(Interpolator, StringSerializable):
 
         return GPRState(regressor=regressor, x_vars=x_vars, y_vars=y_vars)
 
-    def predict(self, x: Dataset, state: GPRState, training_data: tuple[Dataset, Dataset]):
+    def predict(self, x: Dataset, state: GPRState, training_data: tuple[Dataset, Dataset], 
+                groups: list[list[str]] = None):
         """Predict the output of the model at points `x` using the Gaussian Process Regressor provided in `state`.
 
         :param x: the input Dataset `dict` mapping input variables to prediction locations

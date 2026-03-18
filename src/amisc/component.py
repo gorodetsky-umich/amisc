@@ -399,6 +399,7 @@ class Component(BaseModel, Serializable):
     vectorized: bool = False
     call_unpacked: Optional[bool] = None  # If the model expects inputs/outputs like `func(x1, x2, ...)->(y1, y2, ...)
     ret_unpacked: Optional[bool] = None
+    groups: Optional[list[list[Variable]]] = None  # Optional grouping of inputs for global optimization
 
     # Data storage/states for a MISC component
     active_set: list | set | IndexSet = IndexSet()     # set of active (alpha, beta) multi-indices
@@ -799,7 +800,8 @@ class Component(BaseModel, Serializable):
             if cached and (data := self._cache.get("training", {}).get(alpha, {}).get(beta)) is not None:
                 return data
             else:
-                return self.training_data.get(alpha, beta[:len(self.data_fidelity)], y_vars=y_vars, skip_nan=True)
+                return self.training_data.get(alpha, beta[:len(self.data_fidelity)], y_vars=y_vars, skip_nan=True, 
+                                              groups = self.groups)
         except Exception as e:
             self.logger.error(f"Error getting training data for alpha={alpha}, beta={beta}.")
             raise e
@@ -1117,7 +1119,7 @@ class Component(BaseModel, Serializable):
                 args = (self.misc_states.get((alpha, beta)),
                         self.get_training_data(alpha, beta, y_vars=y_vars, cached=True))
 
-                results.append(self.interpolator.predict(inputs, *args) if executor is None else
+                results.append(self.interpolator.predict(inputs, *args, groups = self.groups) if executor is None else
                                executor.submit(self.interpolator.predict, inputs, *args))
 
         if executor is not None:
@@ -1217,7 +1219,7 @@ class Component(BaseModel, Serializable):
                 continue
 
             design_coords, design_pts = self.training_data.refine(a, b[:len(self.data_fidelity)],
-                                                                  domains, list(self.misc_states),weight_fcns)
+                                                                  domains,weight_fcns, groups = self.groups)
             design_pts, fc = to_model_dataset(design_pts, self.inputs, del_latent=True, **field_coords)
 
             # Remove duplicate (alpha, coords) pairs -- so you don't evaluate the model twice for the same input
@@ -1288,7 +1290,8 @@ class Component(BaseModel, Serializable):
             self.misc_costs[a, b] = num_train_pts
             self.misc_states[a, b] = self.interpolator.refine(b[len(self.data_fidelity):],
                                                               self.training_data.get(a, b[:len(self.data_fidelity)],
-                                                                                     y_vars=y_vars, skip_nan=True),
+                                                                                     y_vars=y_vars, skip_nan=True, 
+                                                                                     groups = self.groups),
                                                               self.misc_states.get((alpha, beta)),
                                                               domains)
             start_idx = end_idx

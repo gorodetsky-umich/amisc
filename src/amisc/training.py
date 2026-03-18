@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import itertools
+import warnings
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
@@ -17,11 +18,19 @@ from typing import Any, ClassVar
 import numpy as np
 from numpy.typing import ArrayLike
 from scipy.optimize import direct, minimize
-from sklearn.gaussian_process.kernels import WhiteKernel
+from sklearn.exceptions import ConvergenceWarning
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, WhiteKernel
+from sklearn.gaussian_process.kernels import ConstantKernel as C
+from sklearn.pipeline import Pipeline
 
 from amisc.serialize import PickleSerializable, Serializable
 from amisc.typing import LATENT_STR_ID, Dataset, MultiIndex
 from amisc.utils import _RidgeRegression
+
+# silence sklearn GPR warnings (ConvergenceWarning, UserWarning) coming from gaussian_process internals
+warnings.filterwarnings("ignore", category=ConvergenceWarning, module=r"sklearn\.gaussian_process.*")
+warnings.filterwarnings("ignore", category=UserWarning, module=r"sklearn\.gaussian_process.*")
 
 __all__ = ['TrainingData', 'SparseGrid']
 
@@ -155,6 +164,11 @@ class SparseGrid(TrainingData, PickleSerializable):
     :ivar yi_nan_map: a `dict` of imputed model outputs for each grid coordinate where the model failed (or gave nan)
     :ivar error_map: a `dict` of error information for each grid coordinate where the model failed
     :ivar latent_size: the number of latent coefficients for each variable (0 if scalar)
+    :ivar d_thresh: minimum distance threshold for new points (as fraction of input domain) for uncertainty sampling
+    :ivar thresh_relax: relaxation factor for minimum distance threshold if no new points are found for uncertainty 
+                        sampling
+    :ivar variance_criterion: criterion for selecting new points based on GP uncertainty, either 'local' or 'global'
+    :ivar grid_size: number of monte carlo samples to evaluate global GP uncertainty for uncertainty sampling
     """
     MAX_IMPUTE_SIZE: ClassVar[int] = 10        # don't try to impute large arrays
 
@@ -162,19 +176,19 @@ class SparseGrid(TrainingData, PickleSerializable):
     knots_per_level: int = 2
     expand_latent_method: str = 'round-robin'  # or 'tensor-product', for converting beta to latent grid sizes
     opt_args: dict = field(default_factory=lambda: {'locally_biased': False, 'maxfun': 300})  # for leja optimizer
-
-    # Additional parameters for uncertainty sampling
-    d_thresh: float = 0.20 # minimum distance threshold for new points (as fraction of input domain)
-    thresh_relax: float = 0.5 # relaxation factor for minimum distance threshold if no new points are found
-    variance_criterion: str = 'local' # or 'global', for uncertainty sampling
-    grid_size: int = 100 # Number of monte carlo samples to evaluate global GP uncertainty     
-
+   
     betas: set[MultiIndex] = field(default_factory=set)
     x_grids: dict[str, ArrayLike] = field(default_factory=dict)
     yi_map: dict[MultiIndex, dict[tuple[int, ...], dict[str, ArrayLike]]] = field(default_factory=dict)
     yi_nan_map: dict[MultiIndex, dict[tuple[int, ...], dict[str, ArrayLike]]] = field(default_factory=dict)
     error_map: dict[MultiIndex, dict[tuple[int, ...], dict[str, Any]]] = field(default_factory=dict)
     latent_size: dict[str, int] = field(default_factory=dict)  # keep track of latent grid sizes for each variable
+
+    # Additional parameters for uncertainty sampling
+    d_thresh: float = 0.20 # minimum distance threshold for new points (as fraction of input domain)
+    thresh_relax: float = 0.5 # relaxation factor for minimum distance threshold if no new points are found
+    variance_criterion: str = 'global' # or 'global', for uncertainty sampling
+    grid_size: int = 100 # Number of monte carlo samples to evaluate global GP uncertainty  
 
     def clear(self):
         """Clear all training data."""
@@ -234,9 +248,9 @@ class SparseGrid(TrainingData, PickleSerializable):
 
         return xi_dict, yi_dict  # Both with elements of shape (N, ...) for N grid points
 
-    def get(self, alpha: MultiIndex, beta: MultiIndex, y_vars: list[str] = None, skip_nan: bool = False):
+    def get(self, alpha: MultiIndex, beta: MultiIndex, y_vars: list[str] = None, skip_nan: bool = False, groups = None):
         """Get the training data from the sparse grid for a given `alpha` and `beta` pair."""
-        return self.get_by_coord(alpha, list(self._expand_grid_coords(beta)), y_vars=y_vars, skip_nan=skip_nan)
+        return self.get_by_coord(alpha, list(self._expand_grid_coords(beta,groups)), y_vars=y_vars, skip_nan=skip_nan)
 
     def set_errors(self, alpha: MultiIndex, beta: MultiIndex, coords: list, errors: list[dict]):
         """Store error information in the sparse-grid for a given multi-index pair."""
@@ -305,7 +319,7 @@ class SparseGrid(TrainingData, PickleSerializable):
                 self.yi_nan_map[alpha][coord] = copy.deepcopy(y_impute)
 
     def refine(self, alpha: MultiIndex, beta: MultiIndex, input_domains: dict, 
-               misc_states: list = None, weight_fcns: dict = None):
+               weight_fcns: dict = None, groups: list[list[str]] = None):
         """Refine the sparse grid for a given `alpha` and `beta` pair and given collocation rules. Return any new
         grid points that do not have model evaluations saved yet.
 
@@ -313,19 +327,27 @@ class SparseGrid(TrainingData, PickleSerializable):
             The `beta` multi-index is used to determine the number of collocation points in each input dimension. The
             length of `beta` should therefore match the number of variables in `x_vars`.
         """
-        if misc_states is None:
-            self.collocation_rule = 'leja'
-        
-        weight_fcns = weight_fcns or {}
+        # Train a Gaussian process regressor for uncertainty-based sampling
+        regressor = None
         if self.collocation_rule == 'uncertainty':
-            match_state = [tup for tup in misc_states if tup[0] == alpha]
-            if match_state: 
-                gp_model = max(match_state, key=lambda x: sum(x[1]))[2].regressor.named_steps['gpr']
-            else: 
-                gp_model = None
-        else: 
-            gp_model = None
-
+            # Check if we have data corresponding to model_fidelity alpha to train a GP on the fly
+            if alpha not in self.yi_map or not self.yi_map[alpha]:
+                regressor = None
+            else:
+                # Retrieve all existing data for 'alpha' and train a GP regressor
+                coords = list(self.yi_map[alpha].keys())
+                xi_dict, yi_dict = self.get_by_coord(alpha, coords)
+                x_vars = list(xi_dict.keys())
+                y_vars = list(yi_dict.keys())
+                x_arr = np.concatenate([xi_dict[var][..., np.newaxis] for var in x_vars], axis=-1)
+                y_arr = np.concatenate([yi_dict[var][..., np.newaxis] for var in y_vars], axis=-1)
+                gp_kernel = C(1, (1e-2,1e2))*RBF(1, (1e-3,1)) 
+                regressor = Pipeline([
+                    ('gpr', GaussianProcessRegressor(kernel=gp_kernel, n_restarts_optimizer=5))
+                ])
+                regressor.fit(x_arr, y_arr)
+        weight_fcns = weight_fcns or {}
+        
         # Initialize a sparse grid for beta=(0, 0, ..., 0)
         if np.sum(beta) == 0:
             if len(self.x_grids) == 0:
@@ -339,18 +361,25 @@ class SparseGrid(TrainingData, PickleSerializable):
                 self.latent_size = num_latent
 
                 new_pt = {}
-                domains = iter(input_domains.items())
-                for grid_size in self.beta_to_knots(beta):
+                domains = iter(input_domains.keys()) if groups is None else iter(groups) 
+                for grid_size in self.beta_to_knots(beta, groups = groups):
                     if isinstance(grid_size, int):  # scalars
-                        var, domain = next(domains)
-                        new_pt[var] = self.collocation_1d(var, grid_size, input_domains, gp_model, 
+                        var = next(domains)
+                        if isinstance(var, str): 
+                            var = var
+                        elif isinstance(var, list) and len(var) == 1: 
+                            var = var[0]
+                        else: 
+                            var = "__".join(map(str, var))
+
+                        new_pt[var] = self.collocation_1d(var, grid_size, input_domains, regressor, 
                                                           method=self.collocation_rule,
                                                           wt_fcn=weight_fcns.get(var, None),
                                                           opt_args=self.opt_args).tolist()
                     else:                           # latent coeffs
                         for s in grid_size:
-                            var, domain = next(domains)
-                            new_pt[var] = self.collocation_1d(var, s, input_domains, gp_model, 
+                            var = next(domains)
+                            new_pt[var] = self.collocation_1d(var, s, input_domains, regressor, 
                                                               method=self.collocation_rule,
                                                               wt_fcn=weight_fcns.get(var, None),
                                                               opt_args=self.opt_args).tolist()
@@ -359,38 +388,48 @@ class SparseGrid(TrainingData, PickleSerializable):
             self.yi_map.setdefault(alpha, dict())
             self.yi_nan_map.setdefault(alpha, dict())
             self.error_map.setdefault(alpha, dict())
-            new_coords = list(self._expand_grid_coords(beta))
+            new_coords = list(self._expand_grid_coords(beta, groups=groups))
             return new_coords, self._extract_grid_points(new_coords)
 
         # Otherwise, refine the sparse grid
         for beta_old in self.betas:
             # Get the first lower neighbor in the sparse grid and refine the 1d grid if necessary
             if self.is_one_level_refinement(beta_old, beta):
-                new_grid_size = self.beta_to_knots(beta)
+                new_grid_size = self.beta_to_knots(beta, groups = groups)
                 inputs = zip(self.x_grids.keys(), self.x_grids.values(), input_domains.values())
 
                 for new_size in new_grid_size:
                     if isinstance(new_size, int):       # scalar grid
                         var, grid, domain = next(inputs)
-                        if len(grid) < new_size:
-                            num_new_pts = new_size - len(grid)
-                            self.x_grids[var] = self.collocation_1d(var, num_new_pts, input_domains, gp_model, 
-                                                                    grid, opt_args=self.opt_args,
-                                                                    wt_fcn=weight_fcns.get(var, None),
-                                                                    method=self.collocation_rule).tolist()
+                        if "__" in var:
+                            grid = np.asarray(grid)
+                            if grid.shape[1] < new_size:
+                                num_new_pts = new_size - grid.shape[1]
+                                self.x_grids[var] = self.collocation_1d(var, num_new_pts, input_domains, regressor,
+                                                                        grid, opt_args=self.opt_args,
+                                                                        wt_fcn=weight_fcns.get(var, None),
+                                                                        method=self.collocation_rule).tolist()
+                        else:
+                            if len(grid) < new_size:
+                                num_new_pts = new_size - len(grid)
+                                self.x_grids[var] = self.collocation_1d(var, num_new_pts, input_domains, regressor, 
+                                                                        grid, opt_args=self.opt_args,
+                                                                        wt_fcn=weight_fcns.get(var, None),
+                                                                        method=self.collocation_rule).tolist()
                     else:                               # latent grid
                         for s_new in new_size:
                             var, grid, domain = next(inputs)
                             if len(grid) < s_new:
                                 num_new_pts = s_new - len(grid)
-                                self.x_grids[var] = self.collocation_1d(var, num_new_pts, input_domains, gp_model, grid,
+                                self.x_grids[var] = self.collocation_1d(var, num_new_pts, input_domains, regressor, 
+                                                                        grid,
                                                                         opt_args=self.opt_args,
                                                                         wt_fcn=weight_fcns.get(var, None),
                                                                         method=self.collocation_rule).tolist()
                 break
 
         new_coords = []
-        for coord in self._expand_grid_coords(beta):
+        for coord in self._expand_grid_coords(beta, groups=groups):
             if coord not in self.yi_map[alpha]:
                 # If we have not computed this grid coordinate yet
                 new_coords.append(coord)
@@ -404,14 +443,25 @@ class SparseGrid(TrainingData, PickleSerializable):
         """Extract the `x` grid points located at `coords` from `x_grids` and return as the `pts` dictionary."""
         if not isinstance(coords, list):
             coords = [coords]
-        pts = {var: np.empty(len(coords)) for var in self.x_grids}
+        # Split grouped variables into individual components
+        const_vars = []
+        for var in self.x_grids.keys():
+            if "__" in var:
+                const_vars.extend(var.split("__"))
+            else:
+                const_vars.append(var)
+        pts = {var: np.empty(len(coords)) for var in const_vars}
 
         for k, coord in enumerate(coords):
             grids = iter(self.x_grids.items())
             for idx in coord:
                 if isinstance(idx, int):        # scalar grid point
                     var, grid = next(grids)
-                    pts[var][k] = grid[idx]
+                    if "__" in var:             # grouped vars
+                        for i, v in enumerate(var.split("__")):
+                            pts[v][k] = grid[i][idx]
+                    else:
+                        pts[var][k] = grid[idx]
                 else:                           # latent coefficients
                     for i in idx:
                         var, grid = next(grids)
@@ -419,9 +469,9 @@ class SparseGrid(TrainingData, PickleSerializable):
 
         return pts
 
-    def _expand_grid_coords(self, beta: MultiIndex):
+    def _expand_grid_coords(self, beta: MultiIndex, groups: list[list[str]] = None):
         """Iterable over all grid coordinates for a given `beta`, accounting for scalars and latent coefficients."""
-        grid_size = self.beta_to_knots(beta)
+        grid_size = self.beta_to_knots(beta, groups = groups)
         grid_coords = []
         for s in grid_size:
             if isinstance(s, int):              # scalars
@@ -468,7 +518,7 @@ class SparseGrid(TrainingData, PickleSerializable):
         return ind.shape[0] == 1 and level_diff[ind] == 1
 
     def beta_to_knots(self, beta: MultiIndex, knots_per_level: int = None, latent_size: dict = None,
-                      expand_latent_method: str = None) -> tuple:
+                      expand_latent_method: str = None, groups: list[list[str]] = None  ) -> tuple:
         """Convert a `beta` multi-index to the number of knots per dimension in the sparse grid.
 
         :param beta: refinement level indices
@@ -476,6 +526,7 @@ class SparseGrid(TrainingData, PickleSerializable):
         :param latent_size: the number of latent coefficients for each variable (0 if scalar); number of variables and
                             order should match the `beta` multi-index
         :param expand_latent_method: method for expanding latent grids, either 'round-robin' or 'tensor-product'
+        :param groups: list of variable groups for handling grouped variables
         :returns: the number of knots/points per dimension for the sparse grid
         """
         knots_per_level = knots_per_level or self.knots_per_level
@@ -483,35 +534,42 @@ class SparseGrid(TrainingData, PickleSerializable):
         expand_latent_method = expand_latent_method or self.expand_latent_method
 
         grid_size = []
-        for i, (var, num_latent) in enumerate(latent_size.items()):
-            if num_latent > 0:
-                match expand_latent_method:
-                    case 'round-robin':
-                        if beta[i] == 0:
-                            grid_size.append((1,) * num_latent)  # initializes all latent grids to 1
-                        else:
-                            latent_refine_idx = (beta[i] - 1) % num_latent
-                            latent_refine_num = ((beta[i] - 1) // num_latent) + 1
-                            latent_beta = tuple([latent_refine_num] * (latent_refine_idx + 1) +
-                                                [latent_refine_num - 1] * (num_latent - latent_refine_idx - 1))
-                            latent_grid = [knots_per_level * latent_beta[j] + 1 for j in range(num_latent)]
-                            grid_size.append(tuple(latent_grid))
-                    case 'tensor-product':
-                        grid_size.append((knots_per_level * beta[i] + 1,) * num_latent)
-                    case other:
-                        raise NotImplementedError(f"Unknown method for expanding latent grids: {other}")
-            else:
+        if groups is None:
+            for i, (var, num_latent) in enumerate(latent_size.items()):
+                if num_latent > 0:
+                    match expand_latent_method:
+                        case 'round-robin':
+                            if beta[i] == 0:
+                                grid_size.append((1,) * num_latent)  # initializes all latent grids to 1
+                            else:
+                                latent_refine_idx = (beta[i] - 1) % num_latent
+                                latent_refine_num = ((beta[i] - 1) // num_latent) + 1
+                                latent_beta = tuple([latent_refine_num] * (latent_refine_idx + 1) +
+                                                    [latent_refine_num - 1] * (num_latent - latent_refine_idx - 1))
+                                latent_grid = [knots_per_level * latent_beta[j] + 1 for j in range(num_latent)]
+                                grid_size.append(tuple(latent_grid))
+                        case 'tensor-product':
+                            grid_size.append((knots_per_level * beta[i] + 1,) * num_latent)
+                        case other:
+                            raise NotImplementedError(f"Unknown method for expanding latent grids: {other}")
+                else:
+                    grid_size.append(knots_per_level * beta[i] + 1)
+        else: 
+            for i in range(len(groups)):
+                # Handle only scalars for now
                 grid_size.append(knots_per_level * beta[i] + 1)
 
         return tuple(grid_size)
 
-    def collocation_1d(self, var: str, N: int, input_domains: dict, gp_model, z_pts: np.ndarray = None,
+
+    def collocation_1d(self, var: str, N: int, input_domains: dict, regressor, z_pts: np.ndarray = None,
                        wt_fcn: callable = None, method='leja', opt_args=None) -> np.ndarray:
         """Find the next `N` points in the 1d sequence of `z_pts` using the provided collocation method.
 
         :param N: number of new points to add to the sequence
-        :param z_bds: bounds on the 1d domain
-        :param z_pts: current univariate sequence `(Nz,)`, start at middle of `z_bds` if `None`
+        :param input_domains: bounds for each input variable, used for optimization domain
+        :param regressor: a trained regressor for uncertainty-based sampling (only used if `method='uncertainty'`)
+        :param z_pts: current univariate sequence `(Nz,)`, start at middle of `input_domains[var]` if `None`
         :param wt_fcn: weighting function, uses a constant weight if `None`, callable as `wt_fcn(z)`
         :param method: collocation method to use, currently only 'leja' is supported
         :param opt_args: extra arguments for the global 1d `direct` optimizer
@@ -521,66 +579,105 @@ class SparseGrid(TrainingData, PickleSerializable):
         if wt_fcn is None:
             wt_fcn = lambda z: 1
         if z_pts is None:
-            z_pts = (input_domains[var][1] + input_domains[var][0]) / 2
+            if isinstance(var, str) and "__" in var: #Grouped vars
+                z_pts = np.array([(input_domains[v][0] 
+                                   + input_domains[v][1]) / 2.0 for v in var.split("__")]).reshape(-1, 1)
+            else:
+                z_pts = (input_domains[var][1] + input_domains[var][0]) / 2
             N = N - 1
         z_pts = np.atleast_1d(z_pts)
 
         match method:
             case 'leja':
-                # Construct Leja sequence by maximizing the Leja objective sequentially
                 for i in range(N):
-                    obj_fun = lambda z: -wt_fcn(np.array(z)) * np.prod(np.abs(z - z_pts))
-                    # Use global DIRECT optimization over 1d domain
-                    res = direct(obj_fun, [input_domains[var]], **opt_args)  
-                    z_star = res.x
-                    z_pts = np.concatenate((z_pts, z_star))
-            case 'uncertainty': 
-                # Use GP uncertainty to select new points
-                if gp_model is None:
-                    # fallback to Leja behavior when no GP is available
-                    return self.collocation_1d(var, N, input_domains, None, z_pts, wt_fcn=wt_fcn, 
-                                               method='leja', opt_args=opt_args)
-                else: 
+                    # Maximize Leja objective sequentially
+                    if isinstance(var, str) and "__" in var: #Grouped vars
+                        obj_fun = lambda z: -wt_fcn(np.atleast_1d(z)) * np.prod(
+                                    np.linalg.norm(z_pts - np.atleast_1d(z).reshape(-1,1),axis = 0))
+                        bounds = [input_domains[v] for v in var.split("__")]
+                        res = direct(obj_fun, bounds, **opt_args)
+                        z_star = np.atleast_1d(res.x).reshape(-1, 1)
+                        z_pts = np.concatenate((z_pts, z_star), axis = 1)
+                    else:
+                        obj_fun = lambda z: -wt_fcn(np.array(z)) * np.prod(np.abs(z - z_pts))
+                        # Use global DIRECT optimization over 1d domain
+                        res = direct(obj_fun, [input_domains[var]], **opt_args)  
+                        z_star = res.x
+                        z_pts = np.concatenate((z_pts, z_star))
+            case 'uncertainty':
+                if regressor is None:
+                    z_pts = self.collocation_1d(var, N, input_domains, None, z_pts, wt_fcn=wt_fcn, 
+                                            method='leja', opt_args=opt_args)
+                else:
                     if self.variance_criterion == 'local':
-                        d_min = self.d_thresh * (input_domains[var][1] - input_domains[var][0])
-                        def J1(x): 
-                            # Local Variance cost function
+                        if isinstance(var, str) and "__" in var: #Grouped vars
+                            ranges = [input_domains[v][1] - input_domains[v][0] for v in var.split("__")]
+                            d_min = self.d_thresh * np.linalg.norm(ranges)
+                        elif isinstance(var, str) and "__" not in var:
+                            d_min = self.d_thresh * (input_domains[var][1] - input_domains[var][0])
+                        def J1(x): # Objective function for local uncertainty sampling
+                            if isinstance(var, str) and "__" in var: #Grouped vars
+                                x = np.asarray(x).reshape(N, len(var.split("__")))
+                            else:
+                                x = np.asarray(x).reshape(-1,1)
                             var_order = list(self.x_grids.keys())
-                            grids = []
+                            arrays = []
                             for v in var_order:
-                                if v == var:
-                                    grids.append(np.atleast_1d(x))
+                                if v == var: 
+                                    arrays.append(x)
                                 else:
-                                    grids.append(self.x_grids[v])
-                            mesh = np.meshgrid(*grids, indexing='ij')
-                            cand_grid = np.stack([m.reshape(-1) for m in mesh], axis = -1)
-                            _, std = gp_model.predict(cand_grid, return_std = True)
+                                    arr = np.asarray(self.x_grids[v])
+                                    if arr.ndim == 1:
+                                        arrays.append(arr[:,None])
+                                    else:
+                                        arrays.append(arr.T)
+                            size = [arr.shape[0] for arr in arrays]
+                            idxs = [np.arange(n) for n in size]
+                            grids = np.meshgrid(*idxs, indexing='ij')
+                            flat_idxs = [g.ravel() for g in grids]
+                            cand_grid = [A[idx] for A, idx in zip(arrays, flat_idxs)]
+                            cand_grid = np.hstack(cand_grid)
+                            _, std = regressor.predict(cand_grid, return_std=True)
                             variance = std**2
                             return -np.sum(variance)
-                        x0 = np.random.uniform(input_domains[var][0], input_domains[var][1], self.knots_per_level)
-                        constraints = [] # min distance constraints
-                        for xi in z_pts:
-                            constraints.append({'type': 'ineq', 'fun': lambda x, xp=xi: np.abs(x[0] - xp) - d_min})
-                            constraints.append({'type': 'ineq', 'fun': lambda x, xp=xi: np.abs(x[1] - xp) - d_min})
-                            constraints.append({'type': 'ineq', 'fun': lambda x: np.abs(x[0] - x[1]) - d_min})
-                        res = minimize(J1, x0, bounds = [(input_domains[var][0], 
-                                                    input_domains[var][1])] * self.knots_per_level,
-                                                    constraints=constraints)
-                        z_new = res.x
-                        if res.x is None: 
-                            d_min *= self.thresh_relax
-                            constraints = []
-                            for xi in z_pts:
-                                constraints.append({'type': 'ineq', 'fun': lambda x, xp=xi: np.abs(x[0] - xp) - d_min})
-                                constraints.append({'type': 'ineq', 'fun': lambda x, xp=xi: np.abs(x[1] - xp) - d_min})
-                                constraints.append({'type': 'ineq', 'fun': lambda x: np.abs(x[0] - x[1]) - d_min})
-                            res = minimize(J1, x0, bounds = [(input_domains[var][0], 
-                                                        input_domains[var][1])] * self.knots_per_level,
-                                                        constraints=constraints)
-                            z_new = res.x
-                        z_pts = np.concatenate((z_pts, z_new))
+                        if isinstance(var, str) and "__" in var: #Grouped vars
+                            x0 = np.random.uniform([input_domains[v][0] for v in var.split("__")],
+                                                    [input_domains[v][1] for v in var.split("__")],
+                                                    size=(N, len(var.split("__")))).flatten()
+                            bounds = [(input_domains[v][0], input_domains[v][1]) for v in var.split("__")] * N 
+                            constraints = [] # min distance constraints
+                            for xi in z_pts.T:
+                                for i in range(N):
+                                    constraints.append({'type': 'ineq', 'fun': lambda x, xp=xi, i=i: np.linalg.norm(
+                                        x.reshape(N, len(var.split("__")))[i,:] - xp) - d_min})
+                            res = minimize(J1, x0, bounds=bounds, constraints=constraints)
+                            z_star = res.x.reshape(N, len(var.split("__"))).T
+                            z_pts = np.concatenate((z_pts, z_star), axis = 1)
+                        else:
+                            x0 = np.random.uniform(input_domains[var][0], input_domains[var][1], N)
+                            bounds = [(input_domains[var][0], input_domains[var][1])]
+                            constraints = [] # min distance constraints
+                            for xp in z_pts:
+                                constraints.append({
+                                    'type': 'ineq',
+                                    'fun': lambda x, xp=xp: np.abs(float(x)) - xp - d_min
+                                })
+                                constraints.append({
+                                    'type': 'ineq',
+                                    'fun': lambda x, xp=xp: xp - np.abs(float(x)) - d_min
+                                })
+                                # Simpler: enforce |x - xp| >= d_min
+                                constraints.append({
+                                    'type': 'ineq',
+                                    'fun': lambda x, xp=xp: np.abs(float(x) - xp) - d_min
+                                })
+                            res = minimize(J1, x0, bounds=bounds)
+                            z_star = res.x
+                            z_pts = np.concatenate((z_pts, z_star))
+
+
                     elif self.variance_criterion == 'global':
-                        kernel = gp_model.kernel_
+                        kernel = regressor.named_steps['gpr'].kernel_
                         if isinstance(kernel, WhiteKernel):
                             noise_var = kernel.noise_level
                         elif hasattr(kernel, "k1") and isinstance(kernel.k1, WhiteKernel):
@@ -589,52 +686,71 @@ class SparseGrid(TrainingData, PickleSerializable):
                             noise_var = kernel.k2.noise_level
                         else:
                             noise_var = 0
-                        def J2(x):
-                            # Global Variance cost function
+                        def J2(x): # Objective function for global uncertainty sampling
+                            T = np.zeros((self.grid_size, len(input_domains.keys())))
+                            for i, domain in enumerate(input_domains.values()):
+                                low, high = domain
+                                T[:,i] = np.random.uniform(low, high, self.grid_size)
+                            if isinstance(var, str) and "__" in var: #Grouped vars
+                                x = np.asarray(x).reshape(N, len(var.split("__")))
+                            else:
+                                x = np.asarray(x).reshape(-1,1)
                             var_order = list(self.x_grids.keys())
-                            N = self.grid_size
-                            T = np.zeros((N, len(var_order)))
-                            for i, var in enumerate(var_order):
-                                low, high = input_domains[var]
-                                T[:,i] = np.random.uniform(low, high, N)
-                            grids = []
+                            arrays = []
                             for v in var_order:
-                                if v == var:
-                                    grids.append(np.atleast_1d(x))
-                                else: 
-                                    grids.append(np.atleast_1d(self.x_grids[v]))
-                            mesh = np.meshgrid(*grids, indexing='ij')
-                            cand_grid = np.stack([m.reshape(-1) for m in mesh], axis=-1)
+                                if v == var: 
+                                    arrays.append(x)
+                                else:
+                                    arr = np.asarray(self.x_grids[v])
+                                    if arr.ndim == 1:
+                                        arrays.append(arr[:,None])
+                                    else:
+                                        arrays.append(arr.T)
+                            size = [arr.shape[0] for arr in arrays]
+                            idxs = [np.arange(n) for n in size]
+                            grids = np.meshgrid(*idxs, indexing='ij')
+                            flat_idxs = [g.ravel() for g in grids]
+                            cand_grid = [A[idx] for A, idx in zip(arrays, flat_idxs)]
+                            cand_grid = np.hstack(cand_grid)
                             Q = np.vstack((T, cand_grid))
-                            _, cov = gp_model.predict(Q, return_cov=True)
+                            _, cov = regressor.predict(Q, return_cov=True)
                             if cov.ndim == 2:
-                                cov_TT = cov[:N, :N]
-                                cov_Tx = cov[:N, N:]
-                                cov_xT = cov[N:, :N]
-                                cov_xx = cov[N:, N:]
+                                cov_TT = cov[:self.grid_size, :self.grid_size]
+                                cov_Tx = cov[:self.grid_size, self.grid_size:]
+                                cov_xT = cov[self.grid_size:, :self.grid_size]
+                                cov_xx = cov[self.grid_size:, self.grid_size:]
                                 sigma_bar_T = (np.diag(cov_TT)- cov_Tx
                                                @ (np.linalg.pinv(cov_xx + noise_var * np.eye(cov_xx.shape[0]))
                                                 @ cov_xT))
                                 return np.sum(sigma_bar_T)
-                            else: 
+                            else:
                                 cost = 0
                                 cov_shape = cov.shape
                                 for i in range(cov_shape[2]):
                                     cov_yi = cov[:,:,i]
-                                    cov_TT = cov_yi[:N, :N]
-                                    cov_Tx = cov_yi[:N, N:]
-                                    cov_xT = cov_yi[N:, :N]
-                                    cov_xx = cov_yi[N:, N:]
+                                    cov_TT = cov_yi[:self.grid_size, :self.grid_size]
+                                    cov_Tx = cov_yi[:self.grid_size, self.grid_size:]
+                                    cov_xT = cov_yi[self.grid_size:, :self.grid_size]
+                                    cov_xx = cov_yi[self.grid_size:, self.grid_size:]
                                     sigma_bar_T = np.diag(cov_TT) - cov_Tx @ (np.linalg.pinv(cov_xx) @ cov_xT)
                                 cost += np.sum(sigma_bar_T)
                             return cost
-                            
-                        x0 = np.random.uniform(input_domains[var][0], input_domains[var][1], self.knots_per_level)
-                        res = minimize(J2, x0, 
-                                       bounds = [(input_domains[var][0], input_domains[var][1])] * self.knots_per_level)
-                        z_new = res.x
-                        z_pts = np.concatenate((z_pts, z_new))
+                        if isinstance(var, str) and "__" in var: #Grouped vars
+                            x0 = np.random.uniform([input_domains[v][0] for v in var.split("__")],
+                                                    [input_domains[v][1] for v in var.split("__")],
+                                                    size=(N, len(var.split("__")))).flatten()
+                            bounds = [(input_domains[v][0], input_domains[v][1]) for v in var.split("__")] * N
+                            res = minimize(J2, x0, bounds=bounds)
+                            z_star = res.x.reshape(N, len(var.split("__"))).T
+                            z_pts = np.concatenate((z_pts, z_star), axis = 1)
+                        else:
+                            x0 = np.random.uniform(input_domains[var][0], input_domains[var][1], N)
+                            res = minimize(J2, x0, 
+                                        bounds = [(input_domains[var][0], input_domains[var][1])] * N)
+                            z_star = res.x
+                            z_pts = np.concatenate((z_pts, z_star))
             case other:
-                raise NotImplementedError(f"Unknown collocation method: {other}")
-
+                raise NotImplementedError(f"Unknown collocation method: {other}")       
+                        
         return z_pts
+                    
